@@ -3,7 +3,7 @@ Detection of No Ball events from side cam angle
 
 
 1. pip install -r requirement.txt
-2. Download the models from this [drive link](https://drive.google.com/drive/folders/1P0b5Pqgpu1xc9IxZj5D6A3uKmGYYjQea?usp=sharing) and put the model files inside ./models directory.
+2. Download the models from this [drive link](https://drive.google.com/drive/folders/1P0b5Pqgpu1xc9IxZj5D6A3uKmGYYjQea?usp=sharing) and put the model files inside `./models` directory.
 3. run `python3 detect_noball_find_peak_frame_with_region3.py`
 
 # To-Dos
