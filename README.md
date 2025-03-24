@@ -8,6 +8,6 @@ Detection of No Ball events from side cam angle
 
 # To-Dos
 
-- [] Update shoe detection dataset. Get all the previouis dataset [here](https://drive.google.com/drive/folders/19p5GvCAyA4s-xLZ5GvYcnhs2wqeXV37V?usp=sharing)
-- [] retrain and finetune the shoe detection model
-- [] fine sam2 or use more scalable model for faster segmentation
+- [ ] Update shoe detection dataset. Get all the previouis dataset [here](https://drive.google.com/drive/folders/19p5GvCAyA4s-xLZ5GvYcnhs2wqeXV37V?usp=sharing)
+- [ ] retrain and finetune the shoe detection model
+- [ ] fine sam2 or use more scalable model for faster segmentation
