@@ -3,16 +3,36 @@ from ultralytics import YOLO, SAM
 import cv2
 import numpy as np
 import time
+import logging
+import psutil
+import os
+from datetime import datetime
 # import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from shapely.geometry import Point, Polygon
 
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('no_ball_detection.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 class NoBallDetector:
-    def __init__(self, bowler_model_path, shoe_model_path, seg_model_path, video_path):
+    def __init__(self, bowler_model_path, shoe_model_path, seg_model_path, video_path, right_to_left=False):
         self.line_points = []
+        self.right_to_left = right_to_left
         self.max_y_persistent_peak = None
         self.max_y_persistent_centroid = None
         self.persistent_centroid = None
+        self.heel_point = None
+        self.heel_points = []
+        self.toe_point = None  # Added toe point
+        self.toe_points = []  # Track toe points over frames
         self.min_centroids = []
         self.bowler_bottom_rights = []
         self.max_peak_y = None
@@ -36,6 +56,22 @@ class NoBallDetector:
         self.prev_shoe_box = None
         self.prev_fielder_box = None
         self.iou_threshold = 0.3
+        self.current_heel_point = None  # Current frame heel point
+        self.persistent_heel_point = None  # Persistent heel point
+        self.prev_heel_point = None  # Previous frame heel point
+        self.heel_crossed_line = False  # Track if heel has crossed the line
+        self.heel_returning = False  # Track if heel is returning
+        self.prev_heel_side = None  # Previous side of heel point
+        self.curr_heel_side = None  # Current side of heel point
+
+        # New toe point tracking variables
+        self.current_toe_point = None  # Current frame toe point
+        self.persistent_toe_point = None  # Persistent toe point
+        self.prev_toe_point = None  # Previous frame toe point
+        self.toe_crossed_line = False  # Track if toe has crossed the line
+        self.toe_returning = False  # Track if toe is returning
+        self.prev_toe_side = None  # Previous side of toe point
+        self.curr_toe_side = None  # Current side of toe point
 
         self.bowler_model = YOLO(bowler_model_path)
         self.shoe_model = YOLO(shoe_model_path)
@@ -48,6 +84,9 @@ class NoBallDetector:
         self.video_path = video_path
         self.cap = cv2.VideoCapture(video_path)
         self.video_name = video_path.split('/')[-1].split('.')[0]
+        # Create video-specific output directory
+        self.output_dir = os.path.join('./misc', self.video_name)
+        os.makedirs(self.output_dir, exist_ok=True)
 
         if not self.cap.isOpened():
             print("Error: Could not open video.")
@@ -124,17 +163,29 @@ class NoBallDetector:
 
                 # Find the leftmost shoe
                 if centroids:
-                    min_x_point = min(centroids, key=lambda c: c[0])
-                    if self.prev_centroid is None or self.prev_centroid[0] > min_x_point[0] and not self.bowler_returning:
-                        print('prev_centroid: +++++++++++++++++++++++++++', self.prev_centroid)                    
-                        print('min_x: +++++++++++++++++++++++++++++++++++++++++++++++++', min_x_point)
-                        self.min_centroids.append(min_x_point)
+                    if not self.right_to_left:
+                        min_x_point = min(centroids, key=lambda c: c[0])
+                        if self.prev_centroid is None or self.prev_centroid[0] > min_x_point[0] and not self.bowler_returning:
+                            print('prev_centroid: +++++++++++++++++++++++++++', self.prev_centroid)
+                            print('min_x: +++++++++++++++++++++++++++++++++++++++++++++++++', min_x_point)
+                            self.min_centroids.append(min_x_point)
 
-                    elif self.bowler_returning:
-                        self.min_centroids.clear()
+                        elif self.bowler_returning:
+                            self.min_centroids.clear()
+                    else:
+                        min_x_point = min(centroids, key=lambda c: c[0])
+                        if self.prev_centroid is None or self.prev_centroid[0] < min_x_point[
+                            0] and not self.bowler_returning:
+                            print('prev_centroid: +++++++++++++++++++++++++++', self.prev_centroid)
+                            print('min_x: +++++++++++++++++++++++++++++++++++++++++++++++++', min_x_point)
+                            self.min_centroids.append(min_x_point)
+
+                        elif self.bowler_returning:
+                            self.min_centroids.clear()
 
                     self.prev_centroid = min_x_point
-                
+
+                sx_min, sy_min, sx_max, sy_max = self.add_padding_to_bbox([sx_min, sy_min, sx_max, sy_max])
                 self.prompted_bbox = [sx_min, sy_min, sx_max, sy_max]  # [x1, y1, x2, y2]
 
 
@@ -175,7 +226,7 @@ class NoBallDetector:
     def create_parallel_line_through_point(self, point, line_points):
         """
         Create a parallel line passing through a given point, with the same length as the original line.
-        
+
         :param point: Tuple of (x, y) representing the point through which the parallel line should pass.
         :param line_points: List of two tuples [(x1, y1), (x2, y2)] representing the original line.
         :return: List of two points representing the new parallel line.
@@ -204,7 +255,7 @@ class NoBallDetector:
     def draw_parallel_lines_and_roi(self, image, line_points, point):
         """
         Draws the original line, the parallel line through the given point, and the ROI joining the two lines.
-        
+
         :param image: The image on which to draw.
         :param line_points: List of two tuples [(x1, y1), (x2, y2)] representing the original line.
         :param point: Tuple of (x, y) representing the point through which the parallel line should pass.
@@ -235,8 +286,9 @@ class NoBallDetector:
         :return: Boolean indicating if the point lies inside the polygon.
         """
         # Convert the list of points to a format compatible with cv2.pointPolygonTest
+        print(polygon_points)
         contour = np.array(polygon_points, dtype=np.int32)
-        
+
         # Use cv2.pointPolygonTest to check if the point is inside (-1 for outside, 0 for on the edge, 1 for inside)
         result = cv2.pointPolygonTest(contour, point, False)
 
@@ -273,6 +325,37 @@ class NoBallDetector:
         numerator = abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1)
         denominator = np.sqrt((y2 - y1) ** 2 + (x2 - x1) ** 2)
         return numerator / denominator if denominator != 0 else float('inf')
+
+    def find_nearest_point_on_line(self, point, line):
+        """Find the nearest point on a line to the given point."""
+        x0, y0 = point
+        (x1, y1), (x2, y2) = line
+
+        # Vector from line point 1 to point
+        dx = x0 - x1
+        dy = y0 - y1
+
+        # Vector representing the line
+        line_dx = x2 - x1
+        line_dy = y2 - y1
+
+        # Line length squared
+        line_len_sq = line_dx**2 + line_dy**2
+
+        # Calculate projection ratio (dot product / line length squared)
+        if line_len_sq == 0:  # Avoid division by zero
+            return (x1, y1)
+
+        ratio = (dx * line_dx + dy * line_dy) / line_len_sq
+
+        # Clamp ratio to [0, 1] to keep point on line segment
+        ratio = max(0, min(1, ratio))
+
+        # Calculate nearest point on line
+        nearest_x = x1 + ratio * line_dx
+        nearest_y = y1 + ratio * line_dy
+
+        return (int(nearest_x), int(nearest_y))
 
     def detect_peaks(self, y_values, persistence_threshold=3):
         # y_values = list(map(lambda x:x[1], centroids))
@@ -334,7 +417,7 @@ class NoBallDetector:
 
         # Detect shoes in the cropped region
         shoe_results = self.shoe_model(bowler_region, conf=0.6)
-        
+
         if len(shoe_results) != 0:
             self.shoe_detected = True
         else:
@@ -350,25 +433,52 @@ class NoBallDetector:
         # cross_product, pos = point_position(line_points, bowler_bottom_right)
 
         if self.bowler_bottom_right and bottom_center and self.bowler_bottom_left:
-            if self.prev_bowler_bottom_right and self.prev_bowler_bottom_center and self.prev_bowler_bottom_left:
-                _, self.prev_side = self.point_position(self.line_points, self.prev_bowler_bottom_right)
-                _, self.curr_side = self.point_position(self.line_points, self.bowler_bottom_right)
+            if not self.right_to_left:
+                if self.prev_bowler_bottom_right and self.prev_bowler_bottom_center and self.prev_bowler_bottom_left:
+                    _, self.prev_side = self.point_position(self.line_points, self.prev_bowler_bottom_right)
+                    _, self.curr_side = self.point_position(self.line_points, self.bowler_bottom_right)
 
-                if self.prev_side == 'right' and self.curr_side == 'left' and not self.bowler_crossed_line:
-                    self.bowler_crossed_line = True
-                    self.put_text_on_frame(frame, '--Bowler crossed line--')
-                    print("-------------------------------------------Bowler crossed line-------------------------------------------")
-                    cv2.imwrite('/home/soumyadeep@quidich.local/soumyadeep/No_Ball/bowled.jpg', frame)
+                    if self.prev_side == 'right' and self.curr_side == 'left' and not self.bowler_crossed_line:
+                        self.bowler_crossed_line = True
+                        self.put_text_on_frame(frame, '--Bowler crossed line--')
+                        print("-------------------------------------------Bowler crossed line-------------------------------------------")
+                        # cv2.imwrite('/home/soumyadeep@quidich.local/soumyadeep/No_Ball/bowled.jpg', frame)
 
-                if self.prev_bowler_bottom_center[0] < bottom_center[0] and self.prev_bowler_bottom_left[0] < self.bowler_bottom_left[0] and self.prev_bowler_bottom_right[0] < self.bowler_bottom_right[0]:
-                    self.bowler_returning = True
-                    self.put_text_on_frame(frame, f'--Bowler returning-- {self.prev_bowler_bottom_center[0], bottom_center[0], self.prev_bowler_bottom_left[0], self.bowler_bottom_left[0], self.prev_bowler_bottom_right[0], self.bowler_bottom_right[0]}')
-                    print("-------------------------------------------Bowler returning-------------------------------------------")
-                    cv2.imwrite('/home/soumyadeep@quidich.local/soumyadeep/No_Ball/bowler_returning.jpg', frame)
-                    
-                elif self.prev_bowler_bottom_center[0] > bottom_center[0] and self.prev_bowler_bottom_left[0] > self.bowler_bottom_left[0] and self.prev_bowler_bottom_right[0] > self.bowler_bottom_right[0]:
-                    self.bowler_returning = False
+                    if self.prev_bowler_bottom_center[0] < bottom_center[0] and self.prev_bowler_bottom_left[0] < self.bowler_bottom_left[0] and self.prev_bowler_bottom_right[0] < self.bowler_bottom_right[0]:
+                        self.bowler_returning = True
+                        self.put_text_on_frame(frame, f'--Bowler returning-- {self.prev_bowler_bottom_center[0], bottom_center[0], self.prev_bowler_bottom_left[0], self.bowler_bottom_left[0], self.prev_bowler_bottom_right[0], self.bowler_bottom_right[0]}')
+                        print("-------------------------------------------Bowler returning-------------------------------------------")
+                        # cv2.imwrite('/home/soumyadeep@quidich.local/soumyadeep/No_Ball/bowler_returning.jpg', frame)
 
+                    elif self.prev_bowler_bottom_center[0] > bottom_center[0] and self.prev_bowler_bottom_left[0] > self.bowler_bottom_left[0] and self.prev_bowler_bottom_right[0] > self.bowler_bottom_right[0]:
+                        self.bowler_returning = False
+
+            else:
+                if self.prev_bowler_bottom_right and self.prev_bowler_bottom_center and self.prev_bowler_bottom_left:
+                    _, self.prev_side = self.point_position(self.line_points, self.prev_bowler_bottom_right)
+                    _, self.curr_side = self.point_position(self.line_points, self.bowler_bottom_right)
+
+                    if self.prev_side == 'left' and self.curr_side == 'right' and not self.bowler_crossed_line:
+                        self.bowler_crossed_line = True
+                        self.put_text_on_frame(frame, '--Bowler crossed line--')
+                        print(
+                            "-------------------------------------------Bowler crossed line-------------------------------------------")
+                        # cv2.imwrite('/home/soumyadeep@quidich.local/soumyadeep/No_Ball/bowled.jpg', frame)
+
+                    if self.prev_bowler_bottom_center[0] > bottom_center[0] and self.prev_bowler_bottom_left[0] > \
+                            self.bowler_bottom_left[0] and self.prev_bowler_bottom_right[0] > self.bowler_bottom_right[
+                        0]:
+                        self.bowler_returning = True
+                        self.put_text_on_frame(frame,
+                                               f'--Bowler returning-- {self.prev_bowler_bottom_center[0], bottom_center[0], self.prev_bowler_bottom_left[0], self.bowler_bottom_left[0], self.prev_bowler_bottom_right[0], self.bowler_bottom_right[0]}')
+                        print(
+                            "-------------------------------------------Bowler returning-------------------------------------------")
+                        # cv2.imwrite('/home/soumyadeep@quidich.local/soumyadeep/No_Ball/bowler_returning.jpg', frame)
+
+                    elif self.prev_bowler_bottom_center[0] < bottom_center[0] and self.prev_bowler_bottom_left[0] < \
+                            self.bowler_bottom_left[0] and self.prev_bowler_bottom_right[0] < self.bowler_bottom_right[
+                        0]:
+                        self.bowler_returning = False
 
             self.prev_bowler_bottom_right = self.bowler_bottom_right
             self.prev_bowler_bottom_center = bottom_center
@@ -382,7 +492,7 @@ class NoBallDetector:
 
     def find_persistent_max_y(self, centroids, frame_num, persistence_threshold=3):
         check_for_foot = False
-        
+
         if centroids and len(self.line_points) == 2:
             # sorted_centroids = sorted(centroids, key=lambda c: c[1], reverse=True)
             sorted_centroids = sorted(centroids, key=lambda c: (-c[1], c[0]))  #sort with max_y them min_x
@@ -393,8 +503,8 @@ class NoBallDetector:
                 elif self.is_point_in_polygon(centroid, self.polygon_pts):
                     check_for_foot = True
                 else:
-                    check_for_foot = False 
-                    
+                    check_for_foot = False
+
                 if check_for_foot:
                     if self.max_y_persistent_centroid is None or frame_num - self.max_y_persistent_centroid['frame_num'] >= persistence_threshold:
                         self.max_y_persistent_centroid = {'centroid': centroid, 'frame_num': frame_num}
@@ -407,34 +517,392 @@ class NoBallDetector:
         centroid_y = (y_min + y_max) / 2
         return [centroid_x, centroid_y]
 
+    def add_padding_to_bbox(self, bbox, padding_factor=0.1):
+        x_min, y_min, x_max, y_max = bbox
+        bbox_width = x_max - x_min
+        bbox_height = y_max - y_min
+        bbox_padded_width = bbox_width * padding_factor
+        bbox_padded_height = bbox_height * padding_factor
+        bbox_padded_x_min = int(x_min - (bbox_padded_width / 2))
+        bbox_padded_y_min = int(y_min - (bbox_padded_height / 2))
+        bbox_padded_x_max = int(x_max + (bbox_padded_width / 2))
+        bbox_padded_y_max = int(y_max + (bbox_padded_height / 2))
+        if bbox_padded_x_min < 0:
+            bbox_padded_x_min = 0
+        if bbox_padded_y_min < 0:
+            bbox_padded_y_min = 0
+        if bbox_padded_x_max > self.frame_width:
+            bbox_padded_x_max = self.frame_width
+        if bbox_padded_y_max > self.frame_height:
+            bbox_padded_y_max = self.frame_height
+        return [bbox_padded_x_min, bbox_padded_y_min, bbox_padded_x_max, bbox_padded_y_max]
+
+    def check_no_ball(self, prompted_bbox, heel_point, toe_point=None):
+        crease_line = np.asarray(self.line_points)
+        crease_line_x = np.min(crease_line[:,0])
+        center_point_x, center_point_y = (prompted_bbox[0] + prompted_bbox[2]) // 2, (prompted_bbox[1] + prompted_bbox[3]) // 2
+
+        # Check no ball using heel point
+        if heel_point:
+            heel_point_x, heel_point_y = heel_point
+            if center_point_x < crease_line_x and heel_point_x < crease_line_x:
+                print("-"*50)
+                print("it's no ball (heel)")
+                print("-"*50)
+
+        # Check no ball using toe point
+        if toe_point:
+            toe_point_x, toe_point_y = toe_point
+            if center_point_x < crease_line_x and toe_point_x < crease_line_x:
+                print("-"*50)
+                print("it's no ball (toe)")
+                print("-"*50)
+
+        # Original commented code
+        # else:
+        #     if center_point_x < crease_line_x and prompted_bbox[2] < crease_line_x:
+        #         print("-"*50)
+        #         print("it's no ball")
+        #         print("-"*50)
+
+    def calculate_angle_with_horizontal(self, point1, point2):
+        """
+        Calculate the angle between the line connecting two points and the horizontal axis.
+        Returns angle in degrees.
+        """
+        x1, y1 = point1
+        x2, y2 = point2
+
+        # Calculate the angle using arctangent
+        angle_rad = np.arctan2(y2 - y1, x2 - x1)
+        angle_deg = np.degrees(angle_rad)
+
+        # Convert to positive angle if negative
+        if angle_deg < 0:
+            angle_deg += 360
+
+        return angle_deg
+
     def draw_segmentation(self, shoe_seg, prompted_bbox, frame):
         masks = shoe_seg[0].masks.data.cpu().numpy()
-
-        print(masks)
-
+        heel_point = None
+        toe_point = None
+        persistent_centroid_x, persistent_centroid_y = int(self.persistent_centroid[0]), int(
+            self.persistent_centroid[1])
         # Create an empty image for the mask
         mask_image = np.zeros_like(frame)
 
         for mask in masks:
-            mask  = mask.astype(np.uint8)
-
+            mask = mask.astype(np.uint8)
             resized_mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-            print(f"Resized mask shape: {resized_mask.shape}, Frame shape: {frame.shape}")
             bbox_mask = np.zeros_like(resized_mask)
 
+            # Apply mask only within the bounding box
             bbox_mask[prompted_bbox[1]:prompted_bbox[3], prompted_bbox[0]:prompted_bbox[2]] = resized_mask[prompted_bbox[1]:prompted_bbox[3], prompted_bbox[0]:prompted_bbox[2]]
-            print(f"Non-zero values in bbox_mask: {np.count_nonzero(bbox_mask)}")
-            mask_image[bbox_mask == 1] = [0, 255, 0]  # Color the mask (green in this case)
-            
+
+            # Find points in the segmentation mask
+            if np.any(bbox_mask):
+                y_coords, x_coords = np.where(bbox_mask == 1)
+                if len(x_coords) > 0:
+                    # Find heel point (maximum y coordinate - lowest point in the foot)
+                    max_y_idx = np.argmax(y_coords)
+                    heel_point = (x_coords[max_y_idx], y_coords[max_y_idx])
+
+                    # Find toe point based on direction (either rightmost or leftmost point)
+                    if not self.right_to_left:
+                        # For left-to-right movement, toe is the minimum x coordinate
+                        min_x_idx = np.argmin(x_coords)
+                        toe_point = (x_coords[min_x_idx], y_coords[min_x_idx])
+
+                        # Handle special case for heel
+                        if heel_point[0] <= persistent_centroid_x:
+                            max_x_idx = np.argmax(x_coords)
+                            heel_point = (x_coords[max_x_idx], y_coords[max_x_idx])
+                    else:
+                        # For right-to-left movement, toe is the maximum x coordinate
+                        max_x_idx = np.argmax(x_coords)
+                        toe_point = (x_coords[max_x_idx], y_coords[max_x_idx])
+
+                        # Handle special case for heel
+                        if heel_point[0] >= persistent_centroid_x:
+                            min_x_idx = np.argmin(x_coords)
+                            heel_point = (x_coords[min_x_idx], y_coords[min_x_idx])
+
+            mask_image[bbox_mask == 1] = [0, 255, 0]  # Color the mask (green)
+
         segmented_image = cv2.addWeighted(frame, 0.7, mask_image, 0.3, 0)
 
-        return segmented_image
+        # Save the current heel point for this frame
+        self.current_heel_point = heel_point
+        # Save the current toe point for this frame
+        self.current_toe_point = toe_point
+
+        # Check for no ball using both points
+        self.check_no_ball(prompted_bbox, heel_point, toe_point)
+
+        # Process heel point
+        if heel_point:
+            if self.persistent_heel_point is None:
+                self.persistent_heel_point = heel_point
+                self.heel_points.append(heel_point)
+
+            # Draw current heel point
+            cv2.circle(segmented_image, heel_point, 5, (0, 0, 255), -1)  # Red dot for heel
+            cv2.putText(segmented_image, 'Heel Point', (heel_point[0] - 30, heel_point[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+            # Calculate and visualize the distance from the heel point to the selected line
+            if len(self.line_points) == 2:
+                # Find distance from heel point to line
+                distance = self.point_line_distance(heel_point, self.line_points)
+
+                # Find nearest point on line
+                nearest_point = self.find_nearest_point_on_line(heel_point, self.line_points)
+
+                # Draw line from heel point to nearest point on line
+                cv2.line(segmented_image, heel_point, nearest_point, (255, 0, 255), 2)
+
+                # Add the distance text
+                cv2.putText(segmented_image, f'Heel Dist: {distance:.2f} px',
+                           (heel_point[0] + 10, heel_point[1] + 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+
+                # Store the heel point if it's closest to the line
+                if self.heel_point is None or distance < self.point_line_distance(self.heel_point, self.line_points):
+                    self.heel_point = heel_point
+                    self.heel_points.append(heel_point)
+                    # Update persistent heel point if this one is closer to the line
+                    self.persistent_heel_point = heel_point
+
+                # Track heel point movement and line crossing
+                if self.prev_heel_point is not None:
+                    _, self.prev_heel_side = self.point_position(self.line_points, self.prev_heel_point)
+                    _, self.curr_heel_side = self.point_position(self.line_points, heel_point)
+
+                    if not self.right_to_left:
+                        if self.prev_heel_side == 'right' and self.curr_heel_side == 'left' and not self.heel_crossed_line:
+                            self.heel_crossed_line = True
+                            self.put_text_on_frame(segmented_image, '--Heel crossed line--')
+                            print("-------------------------------------------Heel crossed line-------------------------------------------")
+                            # cv2.imwrite(os.path.join(self.output_dir, f'heel_crossed_line_{self.frame_num}.jpg'), segmented_image)
+
+                        if self.prev_heel_point[0] < heel_point[0] and not self.heel_crossed_line:
+                            self.heel_returning = True
+                            self.put_text_on_frame(segmented_image, f'--Heel returning-- {self.prev_heel_point[0], heel_point[0]}')
+                            print("-------------------------------------------Heel returning-------------------------------------------")
+                            # cv2.imwrite(os.path.join(self.output_dir, f'heel_returning_{self.frame_num}.jpg'), segmented_image)
+                        elif self.prev_heel_point[0] > heel_point[0]:
+                            self.heel_returning = False
+                    else:
+                        if self.prev_heel_side == 'left' and self.curr_heel_side == 'right' and not self.heel_crossed_line:
+                            self.heel_crossed_line = True
+                            self.put_text_on_frame(segmented_image, '--Heel crossed line--')
+                            print("-------------------------------------------Heel crossed line-------------------------------------------")
+                            # cv2.imwrite(os.path.join(self.output_dir, f'heel_crossed_line_{self.frame_num}.jpg'), segmented_image)
+
+                        if self.prev_heel_point[0] > heel_point[0] and not self.heel_crossed_line:
+                            self.heel_returning = True
+                            self.put_text_on_frame(segmented_image, f'--Heel returning-- {self.prev_heel_point[0], heel_point[0]}')
+                            print("-------------------------------------------Heel returning-------------------------------------------")
+                            # cv2.imwrite(os.path.join(self.output_dir, f'heel_returning_{self.frame_num}.jpg'), segmented_image)
+                        elif self.prev_heel_point[0] < heel_point[0]:
+                            self.heel_returning = False
+
+                self.prev_heel_point = heel_point
+
+        # Process toe point
+        if toe_point:
+            if self.persistent_toe_point is None:
+                self.persistent_toe_point = toe_point
+                self.toe_points.append(toe_point)
+
+            # Draw current toe point
+            cv2.circle(segmented_image, toe_point, 5, (255, 0, 0), -1)  # Blue dot for toe
+            cv2.putText(segmented_image, 'Toe Point', (toe_point[0] - 30, toe_point[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+            # Calculate and visualize the distance from the toe point to the selected line
+            if len(self.line_points) == 2:
+                # Find distance from toe point to line
+                toe_distance = self.point_line_distance(toe_point, self.line_points)
+
+                # Find nearest point on line
+                toe_nearest_point = self.find_nearest_point_on_line(toe_point, self.line_points)
+
+                # Draw line from toe point to nearest point on line
+                cv2.line(segmented_image, toe_point, toe_nearest_point, (0, 255, 255), 2)
+
+                # Add the distance text
+                cv2.putText(segmented_image, f'Toe Dist: {toe_distance:.2f} px',
+                           (toe_point[0] + 10, toe_point[1] + 40),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+                # Store the toe point if it's closest to the line
+                if self.toe_point is None or toe_distance < self.point_line_distance(self.toe_point, self.line_points):
+                    self.toe_point = toe_point
+                    self.toe_points.append(toe_point)
+                    # Update persistent toe point if this one is closer to the line
+                    self.persistent_toe_point = toe_point
+
+                # Track toe point movement and line crossing
+                if self.prev_toe_point is not None:
+                    _, self.prev_toe_side = self.point_position(self.line_points, self.prev_toe_point)
+                    _, self.curr_toe_side = self.point_position(self.line_points, toe_point)
+
+                    if not self.right_to_left:
+                        if self.prev_toe_side == 'right' and self.curr_toe_side == 'left' and not self.toe_crossed_line:
+                            self.toe_crossed_line = True
+                            self.put_text_on_frame(segmented_image, '--Toe crossed line--')
+                            print("-------------------------------------------Toe crossed line-------------------------------------------")
+                            # cv2.imwrite(os.path.join(self.output_dir, f'toe_crossed_line_{self.frame_num}.jpg'), segmented_image)
+
+                        if self.prev_toe_point[0] < toe_point[0] and not self.toe_crossed_line:
+                            self.toe_returning = True
+                            self.put_text_on_frame(segmented_image, f'--Toe returning-- {self.prev_toe_point[0], toe_point[0]}')
+                            print("-------------------------------------------Toe returning-------------------------------------------")
+                            # cv2.imwrite(os.path.join(self.output_dir, f'toe_returning_{self.frame_num}.jpg'), segmented_image)
+                        elif self.prev_toe_point[0] > toe_point[0]:
+                            self.toe_returning = False
+                    else:
+                        if self.prev_toe_side == 'left' and self.curr_toe_side == 'right' and not self.toe_crossed_line:
+                            self.toe_crossed_line = True
+                            self.put_text_on_frame(segmented_image, '--Toe crossed line--')
+                            print("-------------------------------------------Toe crossed line-------------------------------------------")
+                            # cv2.imwrite(os.path.join(self.output_dir, f'toe_crossed_line_{self.frame_num}.jpg'), segmented_image)
+
+                        if self.prev_toe_point[0] > toe_point[0] and not self.toe_crossed_line:
+                            self.toe_returning = True
+                            self.put_text_on_frame(segmented_image, f'--Toe returning-- {self.prev_toe_point[0], toe_point[0]}')
+                            print("-------------------------------------------Toe returning-------------------------------------------")
+                            # cv2.imwrite(os.path.join(self.output_dir, f'toe_returning_{self.frame_num}.jpg'), segmented_image)
+                        elif self.prev_toe_point[0] < toe_point[0]:
+                            self.toe_returning = False
+
+                self.prev_toe_point = toe_point
+
+        # If both heel and toe are detected, draw a line between them and calculate angle
+        if heel_point and toe_point:
+            # Calculate distance between heel and toe points
+            distance = np.sqrt((toe_point[0] - heel_point[0])**2 + (toe_point[1] - heel_point[1])**2)
+
+            # Only proceed if distance is greater than 50 pixels
+            if distance > 50:
+                # Draw line between heel and toe
+                cv2.line(segmented_image, heel_point, toe_point, (0, 165, 255), 2)  # Orange line between heel and toe
+
+                # Calculate angle with horizontal axis
+                angle = self.calculate_angle_with_horizontal(heel_point, toe_point)
+
+                # Check if angle indicates ground impact (160-220 degrees)
+                if 170 <= angle <= 190:
+                    impact_text = "Ground Impact Detected!"
+                    impact_color = (0, 255, 0)  # Green color for impact
+
+                    # Check if both heel and toe points have crossed the crease line
+                    _, heel_side = self.point_position(self.line_points, heel_point)
+                    _, toe_side = self.point_position(self.line_points, toe_point)
+
+                    # Calculate heel point distance from the selected line
+                    heel_distance = self.point_line_distance(heel_point, self.line_points)
+
+                    if heel_side == 'left' and toe_side == 'left' and heel_distance > 5:
+                        no_ball_text = "NO BALL - Both points crossed crease"
+                        no_ball_color = (0, 0, 255)  # Red color for no ball
+                        print("-------------------------------------------NO BALL DETECTED-------------------------------------------")
+                        cv2.imwrite(os.path.join(self.output_dir, f'no_ball_detected_{self.frame_num}.jpg'), segmented_image)
+                    else:
+                        no_ball_text = "Normal Delivery"
+                        no_ball_color = (0, 255, 0)  # Green color for normal delivery
+                else:
+                    impact_text = "No Ground Impact"
+                    impact_color = (0, 0, 255)  # Red color for no impact
+                    no_ball_text = ""
+                    no_ball_color = (0, 0, 0)
+
+                # Display angle and impact information
+                angle_text = f"Angle: {angle:.1f}°"
+                cv2.putText(segmented_image, angle_text, (heel_point[0], heel_point[1] - 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                cv2.putText(segmented_image, impact_text, (heel_point[0], heel_point[1] - 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, impact_color, 2)
+
+                # Display no ball status if ground impact is detected
+                if no_ball_text:
+                    cv2.putText(segmented_image, no_ball_text, (heel_point[0], heel_point[1] - 70),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, no_ball_color, 2)
+
+                # Draw circles for heel and toe points
+                cv2.circle(segmented_image, heel_point, 5, (0, 0, 255), -1)  # Red dot for heel
+                cv2.circle(segmented_image, toe_point, 5, (255, 0, 0), -1)  # Blue dot for toe
+
+                # Add labels for heel and toe points
+                cv2.putText(segmented_image, 'Heel Point', (heel_point[0] - 30, heel_point[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                cv2.putText(segmented_image, 'Toe Point', (toe_point[0] - 30, toe_point[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+        return segmented_image, heel_point, toe_point
+
+    def calculate_performance_metrics(self):
+        """Calculate CPU, GPU, and memory usage metrics."""
+        # CPU usage
+        cpu_percent = psutil.cpu_percent()
+        
+        # GPU memory usage (if available)
+        gpu_memory_mb = 0
+        if torch.cuda.is_available():
+            gpu_memory_mb = torch.cuda.memory_allocated() / (1024 * 1024)  # Convert to MB
+        
+        # Memory usage in MB
+        memory = psutil.virtual_memory()
+        memory_used_mb = (memory.total - memory.available) / (1024 * 1024)  # Convert to MB
+        memory_total_mb = memory.total / (1024 * 1024)  # Convert to MB
+        
+        return cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb
+
+    def put_performance_metrics(self, frame, process_time, cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb):
+        """Add performance metrics to the frame."""
+        # Define font and colors
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        color = (0, 255, 0)  # Green color
+        thickness = 2
+        
+        # Get frame dimensions
+        height, width = frame.shape[:2]
+        
+        # Create text lines
+        lines = [
+            f"Process Time: {process_time:.2f} ms",
+            f"CPU Usage: {cpu_percent:.1f}%",
+            f"GPU Memory: {gpu_memory_mb:.1f} MB",
+            f"RAM: {memory_used_mb:.1f}/{memory_total_mb:.1f} MB"
+        ]
+        
+        # Calculate maximum text width
+        max_text_width = 0
+        for line in lines:
+            (text_width, text_height), _ = cv2.getTextSize(line, font, font_scale, thickness)
+            max_text_width = max(max_text_width, text_width)
+        
+        # Add padding to the right
+        padding = 10
+        x_position = width - max_text_width - padding
+        
+        # Add each line to the frame starting from top
+        for i, line in enumerate(lines):
+            y = 20 * (i + 1)  # Start from top with 20px spacing
+            cv2.putText(frame, line, (x_position, y), font, font_scale, color, thickness)
+        
+        return frame
 
     def run(self):
+        logger.info("Starting no-ball detection process")
         while True:
+            frame_start_time = time.time()
             ret, frame = self.cap.read()
             if not ret:
-                print("End of video or error reading frame.")
+                logger.info("End of video or error reading frame.")
                 break
 
             curr_time = time.time()
@@ -455,6 +923,7 @@ class NoBallDetector:
                     if boxes.cls == 1 and boxes.conf >= 0.5:
                         bowler_detected = True
                         x_min, y_min, x_max, y_max = map(int, boxes.xyxy[0])
+                        x_min, y_min, x_max, y_max = self.add_padding_to_bbox([x_min, y_min, x_max, y_max])
                         bowler_box = [x_min, y_min, x_max, y_max]
                         if self.prev_fielder_box is None:
                             self.prev_fielder_box = bowler_box
@@ -480,34 +949,67 @@ class NoBallDetector:
                         self.stump_bottom_left = (stump_x_min, stump_y_max)
 
                     if bowler_detected and not self.bowler_returning:
-                        self.persistent_centroid = self.find_persistent_max_y(self.min_centroids, self.frame_num)
-                        if self.persistent_centroid and self.shoe_detected:
-                            self.persistent_counter += 1
-                            cv2.circle(frame, (int(self.persistent_centroid[0]), int(self.persistent_centroid[1])), 10, (255, 0, 0), -1)
-                            cv2.putText(frame, f'Persistent Max Y', (int(self.persistent_centroid[0]), int(self.persistent_centroid[1]) - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-                            if self.persistent_counter > fps:
-                                self.persistent_counter = 0
-                            seg_results = self.seg_model(source=frame.copy(), points=[self.persistent_centroid], conf=0.7)
-                            segmented_image = self.draw_segmentation(seg_results, self.prompted_bbox, frame)
+                        if self.shoe_detected:  # Only proceed if shoe is detected
+                            self.persistent_centroid = self.find_persistent_max_y(self.min_centroids, self.frame_num)
+                            if self.persistent_centroid:
+                                # Check if persistent point is within shoe's bbox
+                                px, py = self.persistent_centroid
+                                if (self.prompted_bbox[0] <= px <= self.prompted_bbox[2] and
+                                    self.prompted_bbox[1] <= py <= self.prompted_bbox[3]):
+                                    self.persistent_counter += 1
+                                    cv2.circle(frame, (int(self.persistent_centroid[0]), int(self.persistent_centroid[1])), 10, (255, 0, 0), -1)
+                                    cv2.putText(frame, f'Persistent Max Y', (int(self.persistent_centroid[0]), int(self.persistent_centroid[1]) - 10),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                                    if self.persistent_counter > fps:
+                                        self.persistent_counter = 0
+
+                                    seg_results = self.seg_model(source=frame.copy(), points=[self.persistent_centroid], conf=0.7)
+                                    segmented_image, current_heel_point, current_toe_point = self.draw_segmentation(seg_results, self.prompted_bbox, frame)
+
+                                    # if current_heel_point or self.persistent_heel_point or current_toe_point or self.persistent_toe_point:
+                                        # Save frame with heel and toe point detection in video-specific folder
+                                        # cv2.imwrite(os.path.join(self.output_dir, f'foot_points_frame{self.frame_num}.jpg'), segmented_image)
+                                else:
+                                    # Reset persistent centroid when point is not in shoe's bbox
+                                    self.persistent_centroid = None
+                                    self.persistent_counter = 0
+                        else:
+                            # Reset persistent centroid when shoe is not detected
+                            self.persistent_centroid = None
+                            self.persistent_counter = 0
 
             if len(self.line_points) == 2:
                 _, self.polygon_pts = self.draw_parallel_lines_and_roi(frame, self.line_points, self.stump_bottom_left)
                 cv2.line(frame, self.line_points[0], self.line_points[1], (0, 255, 255), 5)
 
+            # Calculate performance metrics
+            process_time = (time.time() - frame_start_time) * 1000  # Convert to milliseconds
+            cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb = self.calculate_performance_metrics()
+            
+            # Add performance metrics to frame
+            frame = self.put_performance_metrics(frame, process_time, cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb)
+            
+            # Log performance metrics
+            logger.info(f"Frame {self.frame_num} - Process Time: {process_time:.2f}ms, CPU: {cpu_percent:.1f}%, GPU: {gpu_memory_mb:.1f}MB, RAM: {memory_used_mb:.1f}/{memory_total_mb:.1f}MB")
+
             cv2.imshow('Video', frame)
 
             if segmented_image is not None:
+                # Add performance metrics to segmented image as well
+                segmented_image = self.put_performance_metrics(segmented_image, process_time, cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb)
                 cv2.imshow('Video', segmented_image)
-                cv2.imwrite(f'./misc/foot_seg_frame{self.frame_num}.jpg', segmented_image)
+                # Save segmentation frame in video-specific folder
+                cv2.imwrite(os.path.join(self.output_dir, f'foot_seg_frame{self.frame_num}.jpg'), segmented_image)
 
             self.frame_num += 1
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
+                logger.info("Process terminated by user")
                 break
 
         self.cap.release()
         cv2.destroyAllWindows()
+        logger.info("Process completed successfully")
 
 
 
@@ -519,7 +1021,10 @@ if __name__ == "__main__":
     # bowler_model_path="/home/soumyadeep@quidich.local/soumyadeep/No_Ball/models/v11s-640-scrt.pt",
     bowler_model_path="./models/v11s-640-scrt.pt",
     shoe_model_path="./models/shoe_det_best_v1.pt",
-    seg_model_path="./models/sam2_l.pt",
-    video_path="/home/soumyadeep@quidich.local/soumyadeep/No_Ball/SHGN1_S001_S002_T238_deinterlaced.mp4"
+    seg_model_path="./models/sam2.1_l.pt",
+    # video_path="../data/Test_videos/Untitled_mark_T09-35-15-631_cam_3.mp4",
+    video_path="../data/Test_videos/SHGN1_S001_S002_T238_deinterlaced.mp4",
+    # video_path="cam5_30.mp4",
+    right_to_left=False
     )
     detector.run()

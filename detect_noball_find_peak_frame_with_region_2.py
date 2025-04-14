@@ -365,13 +365,13 @@ def mark_bowler(frame, bbox):
                 bowler_crossed_line = True
                 put_text_on_frame('--Bowler crossed line--')
                 print("-------------------------------------------Bowler crossed line-------------------------------------------")
-                cv2.imwrite('/home/soumyadeep@quidich.local/soumyadeep/No_Ball/bowled.jpg', frame)
+                cv2.imwrite('./misc/bowled.jpg', frame)
 
             if prev_bowler_bottom_center[0] < bottom_center[0] and prev_bowler_bottom_left[0] < bowler_bottom_left[0] and prev_bowler_bottom_right[0] < bowler_bottom_right[0]:
                 bowler_returning = True
                 put_text_on_frame(f'--Bowler returning-- {prev_bowler_bottom_center[0], bottom_center[0], prev_bowler_bottom_left[0], bowler_bottom_left[0], prev_bowler_bottom_right[0], bowler_bottom_right[0]}')
                 print("-------------------------------------------Bowler returning-------------------------------------------")
-                cv2.imwrite('/home/soumyadeep@quidich.local/soumyadeep/No_Ball/bowler_returning.jpg', frame)
+                cv2.imwrite('./misc/bowler_returning.jpg', frame)
                 
             elif prev_bowler_bottom_center[0] > bottom_center[0] and prev_bowler_bottom_left[0] > bowler_bottom_left[0] and prev_bowler_bottom_right[0] > bowler_bottom_right[0]:
                 bowler_returning = False
@@ -440,8 +440,8 @@ def draw_segmentation(shoe_seg, prompted_bbox, frame):
 
 
 # bowler_model = YOLO('/home/soumyadeep@quidich.local/soumyadeep/No_Ball/v11s3-1088-scrt.pt')
-bowler_model = YOLO("/home/soumyadeep@quidich.local/soumyadeep/No_Ball/models/v11s-640-scrt.pt")
-shoe_model = YOLO('/home/soumyadeep@quidich.local/soumyadeep/No_Ball/runs/detect/train5/weights/shoe_det_best_v1.pt')
+bowler_model = YOLO("./models/v11s-640-scrt.pt")
+shoe_model = YOLO('./models/shoe_det_best_v1.pt')
 seg_model = SAM('./models/sam2_l.pt')
 
 bowler_model.to(0)
@@ -449,7 +449,7 @@ shoe_model.to(0)
 seg_model.to(0)
 
 
-video_path = "/home/soumyadeep@quidich.local/soumyadeep/No_Ball/SHGN1_S001_S002_T238_deinterlaced.mp4"
+video_path = "./SHGN1_S001_S002_T238_deinterlaced.mp4"
 # video_path = "/home/quidich/z-cam/Untitled_mark_T09-28-51-247_cam_6.mp4"
 # video_path = "/home/soumyadeep@quidich.local/soumyadeep/No_Ball/z-cam/Untitled_mark_T09-35-15-631_cam_3.mp4"
 # video_path = "/home/soumyadeep@quidich.local/soumyadeep/No_Ball/IND_BAN_TEST_1.MOV"
@@ -551,7 +551,7 @@ while True:
                     cv2.circle(frame, (int(persistent_centroid[0]), int(persistent_centroid[1])), 10, (255, 0, 0), -1)
                     cv2.putText(frame, f'Persistent Max Y', (int(persistent_centroid[0]), int(persistent_centroid[1]) - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-                    # cv2.imwrite(f'/home/soumyadeep@quidich.local/soumyadeep/No_Ball/peak_point_frames/{video_name}_max_y_frame_{frame_num}.jpg', frame)
+                    cv2.imwrite(f'./misc/{video_name}_max_y_frame_{frame_num}.jpg', frame)
                     if persistent_counter>fps:
                     # if bowler_returning:
                         # persistent_centroid = None
