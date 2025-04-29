@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class NoBallDetector:
-    def __init__(self, bowler_model_path, shoe_model_path, seg_model_path, video_path, right_to_left=False):
+    def __init__(self, bowler_model_path, shoe_model_path, seg_model_path, input_path, input_type='video', right_to_left=False):
         self.line_points = []
         self.right_to_left = right_to_left
         self.max_y_persistent_peak = None
@@ -81,20 +81,39 @@ class NoBallDetector:
         self.shoe_model.to(0)
         self.seg_model.to(0)
 
-        self.video_path = video_path
-        self.cap = cv2.VideoCapture(video_path)
-        self.video_name = video_path.split('/')[-1].split('.')[0]
+        self.input_path = input_path
+        self.input_type = input_type
+        self.frame_files = []
+        self.current_frame_idx = 0
+
+        if input_type == 'video':
+            self.cap = cv2.VideoCapture(input_path)
+            if not self.cap.isOpened():
+                print("Error: Could not open video.")
+                exit()
+            self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        else:  # frames directory
+            if not os.path.isdir(input_path):
+                print(f"Error: {input_path} is not a valid directory")
+                exit()
+            self.frame_files = sorted([f for f in os.listdir(input_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+            if not self.frame_files:
+                print(f"Error: No image files found in {input_path}")
+                exit()
+            # Read first frame to get dimensions
+            first_frame = cv2.imread(os.path.join(input_path, self.frame_files[0]))
+            if first_frame is None:
+                print(f"Error: Could not read first frame from {input_path}")
+                exit()
+            self.frame_height, self.frame_width = first_frame.shape[:2]
+            self.fps = 30  # Default FPS for frames
+
+        self.video_name = os.path.basename(input_path).split('.')[0]
         # Create video-specific output directory
         self.output_dir = os.path.join('./misc', self.video_name)
         os.makedirs(self.output_dir, exist_ok=True)
-
-        if not self.cap.isOpened():
-            print("Error: Could not open video.")
-            exit()
-
-        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
 
         self.centroid_y_values = []
         self.frame_num = 0
@@ -102,6 +121,27 @@ class NoBallDetector:
 
         cv2.namedWindow('Video')
         cv2.setMouseCallback('Video', self.select_points)
+
+    def get_next_frame(self):
+        if self.input_type == 'video':
+            ret, frame = self.cap.read()
+            if not ret:
+                return None
+            frame = cv2.resize(frame, (1920, 1080))
+            return frame
+        else:  # frames directory
+            if self.current_frame_idx >= len(self.frame_files):
+                return None
+            frame_path = os.path.join(self.input_path, self.frame_files[self.current_frame_idx])
+            frame = cv2.imread(frame_path)
+            self.current_frame_idx += 1
+            frame = cv2.resize(frame, (1920, 1080))
+            return frame
+
+    def release_resources(self):
+        if self.input_type == 'video':
+            self.cap.release()
+        cv2.destroyAllWindows()
 
     def put_text_on_frame(self, frame, text):
         # Define font, text color, and background color
@@ -498,7 +538,7 @@ class NoBallDetector:
             sorted_centroids = sorted(centroids, key=lambda c: (-c[1], c[0]))  #sort with max_y them min_x
             for centroid in sorted_centroids:
                 distance_to_line = self.point_line_distance(centroid, self.line_points)
-                if distance_to_line < 50:
+                if distance_to_line < 100:
                     check_for_foot = True
                 elif self.is_point_in_polygon(centroid, self.polygon_pts):
                     check_for_foot = True
@@ -565,23 +605,76 @@ class NoBallDetector:
         #         print("it's no ball")
         #         print("-"*50)
 
-    def calculate_angle_with_horizontal(self, point1, point2):
+    def calculate_angle_with_horizontal(self, heel_point, toe_point):
         """
-        Calculate the angle between the line connecting two points and the horizontal axis.
-        Returns angle in degrees.
+        Calculate the angle between the toe-heel line and a horizontal line.
+        
+        Args:
+            heel_point: Tuple (x, y) representing the heel point
+            toe_point: Tuple (x, y) representing the toe point
+            
+        Returns:
+            float: Angle in degrees between the toe-heel line and horizontal (0-360)
         """
-        x1, y1 = point1
-        x2, y2 = point2
-
-        # Calculate the angle using arctangent
-        angle_rad = np.arctan2(y2 - y1, x2 - x1)
+        # Create a horizontal line at the same y-coordinate as the heel point
+        horizontal_line = [(0, heel_point[1]), (self.frame_width, heel_point[1])]
+        toe_heel_line = [heel_point, toe_point]
+        
+        # Calculate slopes
+        (x1, y1), (x2, y2) = toe_heel_line
+        (x3, y3), (x4, y4) = horizontal_line
+        
+        # Calculate slopes
+        slope1 = (y2 - y1) / (x2 - x1) if (x2 - x1) != 0 else float('inf')
+        slope2 = (y4 - y3) / (x4 - x3) if (x4 - x3) != 0 else float('inf')
+        
+        # Calculate angle in radians
+        if slope1 == float('inf'):
+            angle_rad = np.pi/2  # 90 degrees
+        else:
+            angle_rad = np.arctan2(y2 - y1, x2 - x1)
+        
+        # Convert to degrees and ensure positive angle
         angle_deg = np.degrees(angle_rad)
-
-        # Convert to positive angle if negative
         if angle_deg < 0:
             angle_deg += 360
-
+            
         return angle_deg
+
+    def calculate_angle_between_lines(self, line1_points, line2_points):
+        """
+        Calculate the angle between two lines in degrees.
+        
+        Args:
+            line1_points: List of two points [(x1, y1), (x2, y2)] representing the first line
+            line2_points: List of two points [(x1, y1), (x2, y2)] representing the second line
+            
+        Returns:
+            float: Angle between the two lines in degrees (0-180)
+        """
+        # Extract points for both lines
+        (x1, y1), (x2, y2) = line1_points
+        (x3, y3), (x4, y4) = line2_points
+        
+        # Calculate slopes of both lines
+        slope1 = (y2 - y1) / (x2 - x1) if (x2 - x1) != 0 else float('inf')
+        slope2 = (y4 - y3) / (x4 - x3) if (x4 - x3) != 0 else float('inf')
+        
+        # Handle vertical lines (infinite slope)
+        if slope1 == float('inf') and slope2 == float('inf'):
+            return 0.0  # Both lines are vertical and parallel
+        elif slope1 == float('inf'):
+            # First line is vertical, second line has slope slope2
+            angle = 90 - np.degrees(np.arctan(abs(slope2)))
+        elif slope2 == float('inf'):
+            # Second line is vertical, first line has slope slope1
+            angle = 90 - np.degrees(np.arctan(abs(slope1)))
+        else:
+            # Calculate angle between two non-vertical lines
+            angle = np.degrees(np.arctan(abs((slope2 - slope1) / (1 + slope1 * slope2))))
+        
+        # Ensure angle is between 0 and 180 degrees
+        return min(angle, 180 - angle)
 
     def draw_segmentation(self, shoe_seg, prompted_bbox, frame):
         masks = shoe_seg[0].masks.data.cpu().numpy()
@@ -791,10 +884,13 @@ class NoBallDetector:
                 cv2.line(segmented_image, heel_point, toe_point, (0, 165, 255), 2)  # Orange line between heel and toe
 
                 # Calculate angle with horizontal axis
-                angle = self.calculate_angle_with_horizontal(heel_point, toe_point)
+                # Create a horizontal line (x-axis) at y=0
+                x_axis_line = [(0, 0), (frame.shape[1], 0)]
+                toe_heel_line = [toe_point, heel_point]
+                angle = self.calculate_angle_between_lines(toe_heel_line, x_axis_line)
 
                 # Check if angle indicates ground impact (160-220 degrees)
-                if 170 <= angle <= 190:
+                if -10 <= angle <= 10:
                     impact_text = "Ground Impact Detected!"
                     impact_color = (0, 255, 0)  # Green color for impact
 
@@ -898,11 +994,36 @@ class NoBallDetector:
 
     def run(self):
         logger.info("Starting no-ball detection process")
+        # --- Wait for line selection on the first frame ---
+        first_frame = self.get_next_frame()
+        if first_frame is None:
+            logger.info("End of input or error reading frame.")
+            return
+        while len(self.line_points) < 2:
+            frame_copy = first_frame.copy()
+            self.put_text_on_frame(frame_copy, "Select 2 points for the crease line (Left click)")
+            if len(self.line_points) == 1:
+                cv2.circle(frame_copy, self.line_points[0], 5, (0, 255, 255), -1)
+            cv2.imshow('Video', frame_copy)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                logger.info("Process terminated by user during line selection")
+                self.release_resources()
+                return
+        logger.info(f"Line selected: {self.line_points}")
+        # --- End of line selection logic ---
+        # Reset video/frame index to start from the beginning
+        if self.input_type == 'video':
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        else:
+            self.current_frame_idx = 0
+        self.frame_num = 0
+        self.prev_time = time.time()
+        # --- Main processing loop ---
         while True:
             frame_start_time = time.time()
-            ret, frame = self.cap.read()
-            if not ret:
-                logger.info("End of video or error reading frame.")
+            frame = self.get_next_frame()
+            if frame is None:
+                logger.info("End of input or error reading frame.")
                 break
 
             curr_time = time.time()
@@ -920,7 +1041,7 @@ class NoBallDetector:
 
             for result in bowler_results:
                 for boxes in result.boxes:
-                    if boxes.cls == 1 and boxes.conf >= 0.5:
+                    if boxes.cls == 1 and boxes.conf >= 0.3:
                         bowler_detected = True
                         x_min, y_min, x_max, y_max = map(int, boxes.xyxy[0])
                         x_min, y_min, x_max, y_max = self.add_padding_to_bbox([x_min, y_min, x_max, y_max])
@@ -1007,8 +1128,7 @@ class NoBallDetector:
                 logger.info("Process terminated by user")
                 break
 
-        self.cap.release()
-        cv2.destroyAllWindows()
+        self.release_resources()
         logger.info("Process completed successfully")
 
 
@@ -1016,15 +1136,24 @@ class NoBallDetector:
 
 
 if __name__ == "__main__":
-
+    # Example usage for video
     detector = NoBallDetector(
-    # bowler_model_path="/home/soumyadeep@quidich.local/soumyadeep/No_Ball/models/v11s-640-scrt.pt",
-    bowler_model_path="./models/v11s-640-scrt.pt",
-    shoe_model_path="./models/shoe_det_best_v1.pt",
-    seg_model_path="./models/sam2.1_l.pt",
-    # video_path="../data/Test_videos/Untitled_mark_T09-35-15-631_cam_3.mp4",
-    video_path="../data/Test_videos/SHGN1_S001_S002_T238_deinterlaced.mp4",
-    # video_path="cam5_30.mp4",
-    right_to_left=False
+        bowler_model_path="./models/v11s-640-scrt.pt",
+        shoe_model_path="./models/shoe_det_best_v1.pt",
+        seg_model_path="./models/sam2.1_l.pt",
+        input_path="E:/amnt/quidich/data/17apr/camera08/23_47_17apr25_exp73.mp4",
+        input_type='video',
+        right_to_left=False
     )
     detector.run()
+
+    # # Example usage for frames directory
+    # detector = NoBallDetector(
+    #     bowler_model_path="./models/v11s-640-scrt.pt",
+    #     shoe_model_path="./models/shoe_det_best_v1.pt",
+    #     seg_model_path="./models/sam2.1_l.pt",
+    #     input_path="../data/17apr/camera08/22_39_17apr25_exp64_denoised",
+    #     input_type='frames',
+    #     right_to_left=False
+    # )
+    # detector.run()
