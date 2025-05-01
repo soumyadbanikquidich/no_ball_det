@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class NoBallDetector:
-    def __init__(self, bowler_model_path, shoe_model_path, seg_model_path, input_path, input_type='video', right_to_left=False):
+    def __init__(self, yolo_model_path, shoe_model_path, seg_model_path, input_path, input_type='video', right_to_left=False, fps=30, skip_seconds=3):
         self.line_points = []
         self.right_to_left = right_to_left
         self.max_y_persistent_peak = None
@@ -73,11 +73,11 @@ class NoBallDetector:
         self.prev_toe_side = None  # Previous side of toe point
         self.curr_toe_side = None  # Current side of toe point
 
-        self.bowler_model = YOLO(bowler_model_path)
+        self.yolo_model = YOLO(yolo_model_path)
         self.shoe_model = YOLO(shoe_model_path)
         self.seg_model = SAM(seg_model_path)
 
-        self.bowler_model.to(0)
+        self.yolo_model.to(0)
         self.shoe_model.to(0)
         self.seg_model.to(0)
 
@@ -85,6 +85,7 @@ class NoBallDetector:
         self.input_type = input_type
         self.frame_files = []
         self.current_frame_idx = 0
+        self.skip_seconds = skip_seconds
 
         if input_type == 'video':
             self.cap = cv2.VideoCapture(input_path)
@@ -108,7 +109,7 @@ class NoBallDetector:
                 print(f"Error: Could not read first frame from {input_path}")
                 exit()
             self.frame_height, self.frame_width = first_frame.shape[:2]
-            self.fps = 30  # Default FPS for frames
+            self.fps = fps  # Default FPS for frames
 
         self.video_name = os.path.basename(input_path).split('.')[0]
         # Create video-specific output directory
@@ -118,6 +119,17 @@ class NoBallDetector:
         self.centroid_y_values = []
         self.frame_num = 0
         self.prev_time = time.time()
+
+        # Stump rectangle marking variables
+        self.stump_rect_start = None
+        self.stump_rect_end = None
+        self.stump_rect_confirmed = False
+        self.stump_rect_drawing = False
+        self.stump_rect_box = None  # (x1, y1, x2, y2)
+
+        # Delivery detection/skip logic
+        self.delivery_detected_count = 0
+        self.skip_frames = 0
 
         cv2.namedWindow('Video')
         cv2.setMouseCallback('Video', self.select_points)
@@ -336,11 +348,26 @@ class NoBallDetector:
         return result >= 0
 
     def select_points(self, event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            if len(self.line_points) < 2:
+        # If line selection is not done, handle line points
+        if len(self.line_points) < 2:
+            if event == cv2.EVENT_LBUTTONDOWN:
                 self.line_points.append((x, y))
-            if len(self.line_points) == 2:
-                print(f"Selected Line: {self.line_points}")
+                if len(self.line_points) == 2:
+                    print(f"Selected Line: {self.line_points}")
+            return
+        # If line is selected but stump not confirmed, handle rectangle
+        if not self.stump_rect_confirmed:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.stump_rect_start = (x, y)
+                self.stump_rect_end = (x, y)
+                self.stump_rect_drawing = True
+            elif event == cv2.EVENT_MOUSEMOVE and self.stump_rect_drawing:
+                self.stump_rect_end = (x, y)
+            elif event == cv2.EVENT_LBUTTONUP and self.stump_rect_drawing:
+                self.stump_rect_end = (x, y)
+                self.stump_rect_drawing = False
+                # Rectangle is drawn, but not confirmed yet
+            # No return here, so we can still use Esc/Enter in run()
 
     def point_position(self, line, P):
         A, B = self.line_points
@@ -909,6 +936,12 @@ class NoBallDetector:
                     else:
                         no_ball_text = "Normal Delivery"
                         no_ball_color = (0, 255, 0)  # Green color for normal delivery
+                    
+                    self.delivery_detected_count += 1
+                    if self.delivery_detected_count >= 5:
+                        self.skip_frames = int(self.skip_seconds * self.fps)
+                        self.delivery_detected_count = 0
+                    
                 else:
                     impact_text = "No Ground Impact"
                     impact_color = (0, 0, 255)  # Red color for no impact
@@ -936,6 +969,7 @@ class NoBallDetector:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                 cv2.putText(segmented_image, 'Toe Point', (toe_point[0] - 30, toe_point[1] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
 
         return segmented_image, heel_point, toe_point
 
@@ -999,18 +1033,72 @@ class NoBallDetector:
         if first_frame is None:
             logger.info("End of input or error reading frame.")
             return
-        while len(self.line_points) < 2:
+        selecting = True
+        while selecting:
             frame_copy = first_frame.copy()
-            self.put_text_on_frame(frame_copy, "Select 2 points for the crease line (Left click)")
-            if len(self.line_points) == 1:
-                cv2.circle(frame_copy, self.line_points[0], 5, (0, 255, 255), -1)
+            if len(self.line_points) < 2:
+                self.put_text_on_frame(frame_copy, "Select 2 points for the crease line (Left click). Press Enter to confirm, Esc to reset.")
+            else:
+                self.put_text_on_frame(frame_copy, "Press Enter to confirm points, Esc to reset.")
+            if len(self.line_points) >= 1:
+                for pt in self.line_points:
+                    cv2.circle(frame_copy, pt, 5, (0, 255, 255), -1)
             cv2.imshow('Video', frame_copy)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 logger.info("Process terminated by user during line selection")
                 self.release_resources()
                 return
+            elif key in [13, 10]:  # Enter key (13 on Windows, 10 on some systems)
+                if len(self.line_points) == 2:
+                    selecting = False
+            elif key == 27:  # Escape key
+                self.line_points.clear()
         logger.info(f"Line selected: {self.line_points}")
         # --- End of line selection logic ---
+
+        # --- Stump rectangle marking logic ---
+        stump_selecting = True
+        while stump_selecting:
+            frame_copy = first_frame.copy()
+            # Draw crease line
+            if len(self.line_points) == 2:
+                cv2.line(frame_copy, self.line_points[0], self.line_points[1], (0, 255, 255), 2)
+            # Draw rectangle if being drawn or finished
+            if self.stump_rect_start and self.stump_rect_end:
+                x1, y1 = self.stump_rect_start
+                x2, y2 = self.stump_rect_end
+                cv2.rectangle(frame_copy, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            if not self.stump_rect_confirmed:
+                self.put_text_on_frame(frame_copy, "Mark stumps: Drag to draw rectangle. Enter to confirm, Esc to reset.")
+            else:
+                self.put_text_on_frame(frame_copy, "Stump marked. Press Enter to continue, Esc to reset.")
+            cv2.imshow('Video', frame_copy)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                logger.info("Process terminated by user during stump marking")
+                self.release_resources()
+                return
+            elif key in [13, 10]:  # Enter
+                if self.stump_rect_start and self.stump_rect_end and not self.stump_rect_confirmed:
+                    # Confirm rectangle
+                    x1, y1 = self.stump_rect_start
+                    x2, y2 = self.stump_rect_end
+                    # Normalize coordinates
+                    x_min, x_max = min(x1, x2), max(x1, x2)
+                    y_min, y_max = min(y1, y2), max(y1, y2)
+                    self.stump_rect_box = (x_min, y_min, x_max, y_max)
+                    self.stump_rect_confirmed = True
+                elif self.stump_rect_confirmed:
+                    stump_selecting = False
+            elif key == 27:  # Escape
+                self.stump_rect_start = None
+                self.stump_rect_end = None
+                self.stump_rect_confirmed = False
+                self.stump_rect_box = None
+        logger.info(f"Stump rectangle selected: {self.stump_rect_box}")
+        # --- End of stump rectangle marking logic ---
+
         # Reset video/frame index to start from the beginning
         if self.input_type == 'video':
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -1026,6 +1114,41 @@ class NoBallDetector:
                 logger.info("End of input or error reading frame.")
                 break
 
+            # Skip detection if in skip mode
+            if self.skip_frames > 0:
+                self.skip_frames -= 1
+                self.frame_num += 1
+                # Draw bowler and shoe boxes
+                bowler_results = self.yolo_model(frame, verbose=False, show=False)
+                for result in bowler_results:
+                    for boxes in result.boxes:
+                        if boxes.cls == 0 and boxes.conf >= 0.3:
+                            x_min, y_min, x_max, y_max = map(int, boxes.xyxy[0])
+                            x_min, y_min, x_max, y_max = self.add_padding_to_bbox([x_min, y_min, x_max, y_max])
+                            cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+                            # Draw shoe detections inside bowler box
+                            bowler_region = frame[y_min:y_max, x_min:x_max]
+                            shoe_results = self.shoe_model(bowler_region, conf=0.6)
+                            for shoe_result in shoe_results:
+                                for shoe in shoe_result.boxes:
+                                    sx_min, sy_min, sx_max, sy_max = map(int, shoe.xyxy[0])
+                                    sx_min += x_min
+                                    sy_min += y_min
+                                    sx_max += x_min
+                                    sy_max += y_min
+                                    cv2.rectangle(frame, (sx_min, sy_min), (sx_max, sy_max), (255, 0, 0), 2)
+                # Draw selected crease line and stumps for final display
+                if len(self.line_points) == 2:
+                    cv2.line(frame, self.line_points[0], self.line_points[1], (0, 255, 255), 3)
+                if self.stump_rect_box:
+                    x1, y1, x2, y2 = self.stump_rect_box
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                cv2.imshow('Video', frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    logger.info("Process terminated by user")
+                    break
+                continue
+
             curr_time = time.time()
             fps = 1 / (curr_time - self.prev_time)
             self.prev_time = curr_time
@@ -1033,15 +1156,28 @@ class NoBallDetector:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             # Detect bowler
-            bowler_results = self.bowler_model(frame, verbose=False, show=False)
+            yolo_results = self.yolo_model(frame, verbose=False, show=False)
+            bowler_results = self.yolo_model(frame, verbose=False, show=False)
             bowler_box = []
             fielder_box = []
             bowler_detected = False
             segmented_image = None
 
+            # After detection loop, always use user-marked stumps
+            if self.stump_rect_box:
+                x1, y1, x2, y2 = self.stump_rect_box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                # Set stump_bottom_left as the bottom-left of the marked rectangle
+                self.stump_bottom_left = (x1, y2)
+
+            if len(self.line_points) == 2:
+                _, self.polygon_pts = self.draw_parallel_lines_and_roi(frame, self.line_points,
+                                                                       self.stump_bottom_left)
+
             for result in bowler_results:
                 for boxes in result.boxes:
-                    if boxes.cls == 1 and boxes.conf >= 0.3:
+
+                    if boxes.cls == 0 and boxes.conf >= 0.3:
                         bowler_detected = True
                         x_min, y_min, x_max, y_max = map(int, boxes.xyxy[0])
                         x_min, y_min, x_max, y_max = self.add_padding_to_bbox([x_min, y_min, x_max, y_max])
@@ -1050,58 +1186,55 @@ class NoBallDetector:
                             self.prev_fielder_box = bowler_box
                         frame = self.mark_bowler(frame, bowler_box)
 
-                    elif boxes.cls == 4 and boxes.conf >= 0.4:
-                        x_min, y_min, x_max, y_max = map(int, boxes.xyxy[0])
-                        fielder_box = [x_min, y_min, x_max, y_max]
-                        if self.prev_fielder_box is None:
-                            self.prev_fielder_box = fielder_box
+                    # logic to differntiate between bowler and fielder
+                    # elif boxes.cls == 4 and boxes.conf >= 0.4:
+                    #     x_min, y_min, x_max, y_max = map(int, boxes.xyxy[0])
+                    #     fielder_box = [x_min, y_min, x_max, y_max]
+                    #     if self.prev_fielder_box is None:
+                    #         self.prev_fielder_box = fielder_box
 
-                        if bowler_box and fielder_box and len(bowler_box) == 4 and len(self.prev_fielder_box) == 4:
-                            bowler_iou = self.calculate_iou(bowler_box, self.prev_fielder_box)
+                    #     if bowler_box and fielder_box and len(bowler_box) == 4 and len(self.prev_fielder_box) == 4:
+                    #         bowler_iou = self.calculate_iou(bowler_box, self.prev_fielder_box)
 
-                            if bowler_iou >= 0.7:
-                                self.prev_fielder_box = fielder_box
-                                bowler_detected = True
-                                frame = self.mark_bowler(frame, fielder_box)
+                    #         if bowler_iou >= 0.7:
+                    #             self.prev_fielder_box = fielder_box
+                    #             bowler_detected = True
+                    #             frame = self.mark_bowler(frame, fielder_box)
 
-                    elif boxes.cls == 10 and boxes.conf >= 0.2:
-                        stump_x_min, stump_y_min, stump_x_max, stump_y_max = map(int, boxes.xyxy[0])
-                        cv2.rectangle(frame, (stump_x_min, stump_y_min), (stump_x_max, stump_y_max), (0, 255, 0), 2)
-                        self.stump_bottom_left = (stump_x_min, stump_y_max)
 
-                    if bowler_detected and not self.bowler_returning:
-                        if self.shoe_detected:  # Only proceed if shoe is detected
-                            self.persistent_centroid = self.find_persistent_max_y(self.min_centroids, self.frame_num)
-                            if self.persistent_centroid:
-                                # Check if persistent point is within shoe's bbox
-                                px, py = self.persistent_centroid
-                                if (self.prompted_bbox[0] <= px <= self.prompted_bbox[2] and
-                                    self.prompted_bbox[1] <= py <= self.prompted_bbox[3]):
-                                    self.persistent_counter += 1
-                                    cv2.circle(frame, (int(self.persistent_centroid[0]), int(self.persistent_centroid[1])), 10, (255, 0, 0), -1)
-                                    cv2.putText(frame, f'Persistent Max Y', (int(self.persistent_centroid[0]), int(self.persistent_centroid[1]) - 10),
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-                                    if self.persistent_counter > fps:
-                                        self.persistent_counter = 0
 
-                                    seg_results = self.seg_model(source=frame.copy(), points=[self.persistent_centroid], conf=0.7)
-                                    segmented_image, current_heel_point, current_toe_point = self.draw_segmentation(seg_results, self.prompted_bbox, frame)
+            if bowler_detected and not self.bowler_returning:
+                if self.shoe_detected:  # Only proceed if shoe is detected
+                    self.persistent_centroid = self.find_persistent_max_y(self.min_centroids, self.frame_num)
+                    if self.persistent_centroid:
+                        # Check if persistent point is within shoe's bbox
+                        px, py = self.persistent_centroid
+                        if (self.prompted_bbox[0] <= px <= self.prompted_bbox[2] and
+                            self.prompted_bbox[1] <= py <= self.prompted_bbox[3]):
+                            self.persistent_counter += 1
+                            cv2.circle(frame, (int(self.persistent_centroid[0]), int(self.persistent_centroid[1])), 10, (255, 0, 0), -1)
+                            cv2.putText(frame, f'Persistent Max Y', (int(self.persistent_centroid[0]), int(self.persistent_centroid[1]) - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                            if self.persistent_counter > fps:
+                                self.persistent_counter = 0
 
-                                    # if current_heel_point or self.persistent_heel_point or current_toe_point or self.persistent_toe_point:
-                                        # Save frame with heel and toe point detection in video-specific folder
-                                        # cv2.imwrite(os.path.join(self.output_dir, f'foot_points_frame{self.frame_num}.jpg'), segmented_image)
-                                else:
-                                    # Reset persistent centroid when point is not in shoe's bbox
-                                    self.persistent_centroid = None
-                                    self.persistent_counter = 0
+                            seg_results = self.seg_model(source=frame.copy(), points=[self.persistent_centroid], conf=0.7)
+                            segmented_image, current_heel_point, current_toe_point = self.draw_segmentation(seg_results, self.prompted_bbox, frame)
+
+                            # if current_heel_point or self.persistent_heel_point or current_toe_point or self.persistent_toe_point:
+                                # Save frame with heel and toe point detection in video-specific folder
+                                # cv2.imwrite(os.path.join(self.output_dir, f'foot_points_frame{self.frame_num}.jpg'), segmented_image)
                         else:
-                            # Reset persistent centroid when shoe is not detected
+                            # Reset persistent centroid when point is not in shoe's bbox
                             self.persistent_centroid = None
                             self.persistent_counter = 0
+                else:
+                    # Reset persistent centroid when shoe is not detected
+                    self.persistent_centroid = None
+                    self.persistent_counter = 0
 
             if len(self.line_points) == 2:
                 _, self.polygon_pts = self.draw_parallel_lines_and_roi(frame, self.line_points, self.stump_bottom_left)
-                cv2.line(frame, self.line_points[0], self.line_points[1], (0, 255, 255), 5)
 
             # Calculate performance metrics
             process_time = (time.time() - frame_start_time) * 1000  # Convert to milliseconds
@@ -1110,6 +1243,13 @@ class NoBallDetector:
             # Add performance metrics to frame
             frame = self.put_performance_metrics(frame, process_time, cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb)
             
+            # Draw selected crease line and stumps for final display
+            if len(self.line_points) == 2:
+                cv2.line(frame, self.line_points[0], self.line_points[1], (0, 255, 255), 3)
+            if self.stump_rect_box:
+                x1, y1, x2, y2 = self.stump_rect_box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+
             # Log performance metrics
             logger.info(f"Frame {self.frame_num} - Process Time: {process_time:.2f}ms, CPU: {cpu_percent:.1f}%, GPU: {gpu_memory_mb:.1f}MB, RAM: {memory_used_mb:.1f}/{memory_total_mb:.1f}MB")
 
@@ -1138,22 +1278,25 @@ class NoBallDetector:
 if __name__ == "__main__":
     # Example usage for video
     detector = NoBallDetector(
-        bowler_model_path="./models/v11s-640-scrt.pt",
+        yolo_model_path="./models/yolo11l.pt",
         shoe_model_path="./models/shoe_det_best_v1.pt",
         seg_model_path="./models/sam2.1_l.pt",
-        input_path="E:/amnt/quidich/data/17apr/camera08/23_47_17apr25_exp73.mp4",
+        input_path="E:/amnt/quidich/data/17apr/camera08/16_45_17apr_balltest1.mp4",
         input_type='video',
-        right_to_left=False
+        right_to_left=False,
+        skip_seconds=10
     )
     detector.run()
 
     # # Example usage for frames directory
     # detector = NoBallDetector(
-    #     bowler_model_path="./models/v11s-640-scrt.pt",
+    #     yolo_model_path="./models/yolo11l.pt",
     #     shoe_model_path="./models/shoe_det_best_v1.pt",
     #     seg_model_path="./models/sam2.1_l.pt",
-    #     input_path="../data/17apr/camera08/22_39_17apr25_exp64_denoised",
+    #     input_path="../data/17apr/camera08/23_47_17apr25_exp73",
     #     input_type='frames',
-    #     right_to_left=False
+    #     right_to_left=False,
+    #     fps=100,
+    #     skip_seconds=10
     # )
     # detector.run()
