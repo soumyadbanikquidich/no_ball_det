@@ -10,6 +10,9 @@ from datetime import datetime
 # import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from shapely.geometry import Point, Polygon
+from trackers import SORTTracker
+# Add supervision import for Detections
+import supervision as sv
 
 # Setup logging
 logging.basicConfig(
@@ -73,6 +76,9 @@ class NoBallDetector:
         self.prev_toe_side = None  # Previous side of toe point
         self.curr_toe_side = None  # Current side of toe point
 
+        # Initialize SORTTracker for person tracking
+        self.person_tracker = SORTTracker()
+
         self.yolo_model = YOLO(yolo_model_path)
         self.shoe_model = YOLO(shoe_model_path)
         self.seg_model = SAM(seg_model_path)
@@ -133,6 +139,13 @@ class NoBallDetector:
 
         cv2.namedWindow('Video')
         cv2.setMouseCallback('Video', self.select_points)
+
+        self.selected_track_id = None  # Track ID of selected bbox
+        self.detected_bboxes = []
+        self.detected_track_ids = []
+
+        self.paused = False
+        self.pause_frame = None
 
     def get_next_frame(self):
         if self.input_type == 'video':
@@ -232,8 +245,8 @@ class NoBallDetector:
                             print('min_x: +++++++++++++++++++++++++++++++++++++++++++++++++', min_x_point)
                             self.min_centroids.append(min_x_point)
 
-                        elif self.bowler_returning:
-                            self.min_centroids.clear()
+                        # elif self.bowler_returning:
+                        #     self.min_centroids.clear()
 
                     self.prev_centroid = min_x_point
 
@@ -332,19 +345,12 @@ class NoBallDetector:
     def is_point_in_polygon(self, point, polygon_points):
         """
         Checks if a point lies inside, outside, or on the edge of a polygon.
-
-        :param point: Tuple (x, y) representing the point to check.
-        :param polygon_points: List of tuples [(x1, y1), (x2, y2), ...] representing the polygon vertices.
-        :return: Boolean indicating if the point lies inside the polygon.
         """
-        # Convert the list of points to a format compatible with cv2.pointPolygonTest
-        print(polygon_points)
-        contour = np.array(polygon_points, dtype=np.int32)
-
-        # Use cv2.pointPolygonTest to check if the point is inside (-1 for outside, 0 for on the edge, 1 for inside)
-        result = cv2.pointPolygonTest(contour, point, False)
-
-        # Return True if the point is inside or on the edge
+        # Ensure polygon_points is (N, 2) and int32
+        contour = np.array(polygon_points, dtype=np.int32).reshape(-1, 2)
+        # Ensure point is a tuple of ints
+        point_int = (int(point[0]), int(point[1]))
+        result = cv2.pointPolygonTest(contour, point_int, False)
         return result >= 0
 
     def select_points(self, event, x, y, flags, param):
@@ -366,8 +372,31 @@ class NoBallDetector:
             elif event == cv2.EVENT_LBUTTONUP and self.stump_rect_drawing:
                 self.stump_rect_end = (x, y)
                 self.stump_rect_drawing = False
-                # Rectangle is drawn, but not confirmed yet
+                # If rectangle is drawn and confirmed, set stump_bottom_left and polygon_pts
+                if len(self.line_points) == 2:
+                    x1, y1 = self.stump_rect_start
+                    x2, y2 = self.stump_rect_end
+                    x_min, x_max = min(x1, x2), max(x1, x2)
+                    y_min, y_max = min(y1, y2), max(y1, y2)
+                    self.stump_bottom_left = (x_min, y_max)
+                    # Use a dummy image for draw_parallel_lines_and_roi just to get polygon_pts
+                    dummy_img = np.zeros((self.frame_height, self.frame_width, 3), dtype=np.uint8)
+                    _, self.polygon_pts = self.draw_parallel_lines_and_roi(dummy_img, self.line_points, self.stump_bottom_left)
             # No return here, so we can still use Esc/Enter in run()
+            return
+        # Only allow bbox selection if line, stump, and polygon_pts are set
+        if self.polygon_pts is None:
+            return
+        # After line and stump are selected, handle bbox selection
+        if event == cv2.EVENT_LBUTTONDOWN:
+            for idx, (bbox, track_id) in enumerate(zip(self.detected_bboxes, self.detected_track_ids)):
+                x1, y1, x2, y2 = bbox
+                if x1 <= x <= x2 and y1 <= y <= y2:
+                    if self.selected_track_id == track_id:
+                        self.selected_track_id = None
+                    else:
+                        self.selected_track_id = track_id
+                    return
 
     def point_position(self, line, P):
         A, B = self.line_points
@@ -480,10 +509,10 @@ class NoBallDetector:
         cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
 
         # Crop bowler region
-        bowler_region = frame[y_min:y_max, x_min:x_max]
+        bowler_region = self.pause_frame[y_min:y_max, x_min:x_max]
 
         # Detect shoes in the cropped region
-        shoe_results = self.shoe_model(bowler_region, conf=0.6)
+        shoe_results = self.shoe_model(bowler_region, conf=0.3, verbose=False, show=False)
 
         if len(shoe_results) != 0:
             self.shoe_detected = True
@@ -1109,164 +1138,172 @@ class NoBallDetector:
         # --- Main processing loop ---
         while True:
             frame_start_time = time.time()
-            frame = self.get_next_frame()
-            if frame is None:
-                logger.info("End of input or error reading frame.")
-                break
-
-            # Skip detection if in skip mode
-            if self.skip_frames > 0:
-                self.skip_frames -= 1
-                self.frame_num += 1
-                # Draw bowler and shoe boxes
-                bowler_results = self.yolo_model(frame, verbose=False, show=False)
-                for result in bowler_results:
-                    for boxes in result.boxes:
-                        if boxes.cls == 0 and boxes.conf >= 0.3:
-                            x_min, y_min, x_max, y_max = map(int, boxes.xyxy[0])
-                            x_min, y_min, x_max, y_max = self.add_padding_to_bbox([x_min, y_min, x_max, y_max])
-                            cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-                            # Draw shoe detections inside bowler box
-                            bowler_region = frame[y_min:y_max, x_min:x_max]
-                            shoe_results = self.shoe_model(bowler_region, conf=0.6)
-                            for shoe_result in shoe_results:
-                                for shoe in shoe_result.boxes:
-                                    sx_min, sy_min, sx_max, sy_max = map(int, shoe.xyxy[0])
-                                    sx_min += x_min
-                                    sy_min += y_min
-                                    sx_max += x_min
-                                    sy_max += y_min
-                                    cv2.rectangle(frame, (sx_min, sy_min), (sx_max, sy_max), (255, 0, 0), 2)
-                # Draw selected crease line and stumps for final display
-                if len(self.line_points) == 2:
-                    cv2.line(frame, self.line_points[0], self.line_points[1], (0, 255, 255), 3)
-                if self.stump_rect_box:
-                    x1, y1, x2, y2 = self.stump_rect_box
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                cv2.imshow('Video', frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    logger.info("Process terminated by user")
+            if not self.paused or self.pause_frame is None:
+                frame = self.get_next_frame()
+                if frame is None:
+                    logger.info("End of input or error reading frame.")
                     break
-                continue
+                self.pause_frame = frame.copy()
+            else:
+                frame = self.pause_frame.copy()
 
-            curr_time = time.time()
-            fps = 1 / (curr_time - self.prev_time)
-            self.prev_time = curr_time
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-            # Detect bowler
+            # --- DETECTION AND BBOX SELECTION ---
+            self.detected_bboxes = []
+            self.detected_track_ids = []
             yolo_results = self.yolo_model(frame, verbose=False, show=False)
-            bowler_results = self.yolo_model(frame, verbose=False, show=False)
-            bowler_box = []
-            fielder_box = []
-            bowler_detected = False
-            segmented_image = None
-
-            # After detection loop, always use user-marked stumps
-            if self.stump_rect_box:
-                x1, y1, x2, y2 = self.stump_rect_box
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                # Set stump_bottom_left as the bottom-left of the marked rectangle
-                self.stump_bottom_left = (x1, y2)
-
-            if len(self.line_points) == 2:
-                _, self.polygon_pts = self.draw_parallel_lines_and_roi(frame, self.line_points,
-                                                                       self.stump_bottom_left)
-
-            for result in bowler_results:
-                for boxes in result.boxes:
-
-                    if boxes.cls == 0 and boxes.conf >= 0.3:
-                        bowler_detected = True
-                        x_min, y_min, x_max, y_max = map(int, boxes.xyxy[0])
+            # Collect all person (bowler) detections
+            person_detections = []
+            for result in yolo_results:
+                for box in result.boxes:
+                    if box.cls == 0 and box.conf >= 0.3:
+                        x_min, y_min, x_max, y_max = map(int, box.xyxy[0])
                         x_min, y_min, x_max, y_max = self.add_padding_to_bbox([x_min, y_min, x_max, y_max])
-                        bowler_box = [x_min, y_min, x_max, y_max]
-                        if self.prev_fielder_box is None:
-                            self.prev_fielder_box = bowler_box
-                        frame = self.mark_bowler(frame, bowler_box)
+                        conf = float(box.conf)
+                        person_detections.append([x_min, y_min, x_max, y_max, conf, 0])  # 0 for class_id (person)
+            # Convert to supervision Detections for tracker
+            if person_detections:
+                dets_np = np.array(person_detections)
+                detections = sv.Detections(
+                    xyxy=dets_np[:, :4],
+                    confidence=dets_np[:, 4],
+                    class_id=dets_np[:, 5].astype(int)
+                )
+                tracked = self.person_tracker.update(detections)
+                # tracked.xyxy, tracked.tracker_id
+                for xyxy, track_id in zip(tracked.xyxy.astype(int), tracked.tracker_id):
+                    x1, y1, x2, y2 = xyxy
+                    self.detected_bboxes.append([x1, y1, x2, y2])
+                    self.detected_track_ids.append(track_id)
+            # Draw all detected bboxes with track IDs
+            found_selected = False
+            for idx, (bbox, track_id) in enumerate(zip(self.detected_bboxes, self.detected_track_ids)):
+                x1, y1, x2, y2 = bbox
+                color = (0, 255, 0)  # Green for unselected
+                thickness = 2
+                if self.selected_track_id == track_id:
+                    color = (0, 0, 255)  # Red for selected
+                    thickness = 3
+                    found_selected = True
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+                if self.selected_track_id == track_id:
+                    cv2.putText(frame, 'SELECTED', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                # Display track ID above each bbox
+                cv2.putText(frame, f'ID: {track_id}', (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            # If selected_track_id is set but not found in this frame, auto-unselect
+            if self.selected_track_id is not None and not found_selected:
+                self.selected_track_id = None
 
-                    # logic to differntiate between bowler and fielder
-                    # elif boxes.cls == 4 and boxes.conf >= 0.4:
-                    #     x_min, y_min, x_max, y_max = map(int, boxes.xyxy[0])
-                    #     fielder_box = [x_min, y_min, x_max, y_max]
-                    #     if self.prev_fielder_box is None:
-                    #         self.prev_fielder_box = fielder_box
+            # Find the bbox for the selected track_id (if any)
+            selected_bbox = None
+            if self.selected_track_id is not None:
+                for bbox, track_id in zip(self.detected_bboxes, self.detected_track_ids):
+                    if track_id == self.selected_track_id:
+                        selected_bbox = bbox
+                        break
 
-                    #     if bowler_box and fielder_box and len(bowler_box) == 4 and len(self.prev_fielder_box) == 4:
-                    #         bowler_iou = self.calculate_iou(bowler_box, self.prev_fielder_box)
-
-                    #         if bowler_iou >= 0.7:
-                    #             self.prev_fielder_box = fielder_box
-                    #             bowler_detected = True
-                    #             frame = self.mark_bowler(frame, fielder_box)
-
-
-
-            if bowler_detected and not self.bowler_returning:
-                if self.shoe_detected:  # Only proceed if shoe is detected
-                    self.persistent_centroid = self.find_persistent_max_y(self.min_centroids, self.frame_num)
-                    if self.persistent_centroid:
-                        # Check if persistent point is within shoe's bbox
-                        px, py = self.persistent_centroid
-                        if (self.prompted_bbox[0] <= px <= self.prompted_bbox[2] and
-                            self.prompted_bbox[1] <= py <= self.prompted_bbox[3]):
-                            self.persistent_counter += 1
-                            cv2.circle(frame, (int(self.persistent_centroid[0]), int(self.persistent_centroid[1])), 10, (255, 0, 0), -1)
-                            cv2.putText(frame, f'Persistent Max Y', (int(self.persistent_centroid[0]), int(self.persistent_centroid[1]) - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-                            if self.persistent_counter > fps:
-                                self.persistent_counter = 0
-
-                            seg_results = self.seg_model(source=frame.copy(), points=[self.persistent_centroid], conf=0.7)
-                            segmented_image, current_heel_point, current_toe_point = self.draw_segmentation(seg_results, self.prompted_bbox, frame)
-
-                            # if current_heel_point or self.persistent_heel_point or current_toe_point or self.persistent_toe_point:
-                                # Save frame with heel and toe point detection in video-specific folder
-                                # cv2.imwrite(os.path.join(self.output_dir, f'foot_points_frame{self.frame_num}.jpg'), segmented_image)
-                        else:
-                            # Reset persistent centroid when point is not in shoe's bbox
-                            self.persistent_centroid = None
-                            self.persistent_counter = 0
-                else:
-                    # Reset persistent centroid when shoe is not detected
-                    self.persistent_centroid = None
-                    self.persistent_counter = 0
-
-            if len(self.line_points) == 2:
-                _, self.polygon_pts = self.draw_parallel_lines_and_roi(frame, self.line_points, self.stump_bottom_left)
-
-            # Calculate performance metrics
-            process_time = (time.time() - frame_start_time) * 1000  # Convert to milliseconds
-            cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb = self.calculate_performance_metrics()
-            
-            # Add performance metrics to frame
-            frame = self.put_performance_metrics(frame, process_time, cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb)
-            
-            # Draw selected crease line and stumps for final display
-            if len(self.line_points) == 2:
+            # --- Visualization: Draw crease line, stumps, and ROI ---
+            if len(self.line_points) == 2 and self.stump_rect_box is not None and self.stump_bottom_left is not None:
+                # Draw crease line
                 cv2.line(frame, self.line_points[0], self.line_points[1], (0, 255, 255), 3)
-            if self.stump_rect_box:
+                # Draw stumps rectangle
                 x1, y1, x2, y2 = self.stump_rect_box
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                # Draw ROI (polygon between crease and stumps)
+                frame, _ = self.draw_parallel_lines_and_roi(frame, self.line_points, self.stump_bottom_left)
 
-            # Log performance metrics
-            logger.info(f"Frame {self.frame_num} - Process Time: {process_time:.2f}ms, CPU: {cpu_percent:.1f}%, GPU: {gpu_memory_mb:.1f}MB, RAM: {memory_used_mb:.1f}/{memory_total_mb:.1f}MB")
+            # Show PAUSED overlay if paused
+            if self.paused:
+                cv2.putText(frame, 'PAUSED', (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 4)
 
+            # Only process bowler, shoe, segmentation, etc. if a bbox is selected
+            if selected_bbox is not None and self.polygon_pts is not None:
+                # Mark bowler using the selected bbox
+                frame = self.mark_bowler(frame, selected_bbox)
+                # After detection loop, always use user-marked stumps
+                if self.stump_rect_box:
+                    x1, y1, x2, y2 = self.stump_rect_box
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    self.stump_bottom_left = (x1, y2)
+                if len(self.line_points) == 2:
+                    _, self.polygon_pts = self.draw_parallel_lines_and_roi(frame, self.line_points, self.stump_bottom_left)
+                # Only process shoe/segmentation for selected bbox
+                bowler_detected = True
+                segmented_image = None
+                if bowler_detected and not self.bowler_returning:
+                    if self.shoe_detected:
+                        self.persistent_centroid = self.find_persistent_max_y(self.min_centroids, self.frame_num)
+                        if self.persistent_centroid:
+                            px, py = self.persistent_centroid
+                            if (self.prompted_bbox[0] <= px <= self.prompted_bbox[2] and
+                                self.prompted_bbox[1] <= py <= self.prompted_bbox[3]):
+                                self.persistent_counter += 1
+                                cv2.circle(frame, (int(self.persistent_centroid[0]), int(self.persistent_centroid[1])), 10, (255, 0, 0), -1)
+                                cv2.putText(frame, f'Persistent Max Y', (int(self.persistent_centroid[0]), int(self.persistent_centroid[1]) - 10),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                                if self.persistent_counter > 1:  # Use 1 instead of fps to avoid NameError
+                                    self.persistent_counter = 0
+                                seg_results = self.seg_model(source=self.pause_frame, points=[self.persistent_centroid], conf=0.7)
+                                segmented_image, current_heel_point, current_toe_point = self.draw_segmentation(seg_results, self.prompted_bbox, frame)
+                            else:
+                                self.persistent_centroid = None
+                                self.persistent_counter = 0
+                    else:
+                        self.persistent_centroid = None
+                        self.persistent_counter = 0
+                # Log performance metrics
+                process_time = (time.time() - frame_start_time) * 1000  # Convert to milliseconds
+                cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb = self.calculate_performance_metrics()
+                frame = self.put_performance_metrics(frame, process_time, cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb)
+                cv2.imshow('Video', frame)
+                if segmented_image is not None:
+                    segmented_image = self.put_performance_metrics(segmented_image, process_time, cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb)
+                    cv2.imshow('Video', segmented_image)
+                    cv2.imwrite(os.path.join(self.output_dir, f'foot_seg_frame{self.frame_num}.jpg'), segmented_image)
+                self.frame_num += 1
+                key = cv2.waitKey(0 if self.paused else 1) & 0xFF
+                if key == ord('q'):
+                    logger.info("Process terminated by user")
+                    break
+                elif key == ord(' '):  # Spacebar to toggle pause
+                    self.paused = not self.paused
+                elif self.paused and key == ord('a'):
+                    # Go back one frame
+                    if self.input_type == 'video':
+                        pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, pos - 2))
+                        self.pause_frame = self.get_next_frame()
+                    else:
+                        self.current_frame_idx = max(0, self.current_frame_idx - 2)
+                        self.pause_frame = self.get_next_frame()
+                elif self.paused and key == ord('d'):
+                    # Go forward one frame
+                    self.pause_frame = self.get_next_frame()
+                continue  # Skip the rest of the loop if bbox is selected
+
+            # If no bbox is selected, just show the UI and frame
+            process_time = (time.time() - frame_start_time) * 1000  # Convert to milliseconds
+            cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb = self.calculate_performance_metrics()
+            frame = self.put_performance_metrics(frame, process_time, cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb)
             cv2.imshow('Video', frame)
-
-            if segmented_image is not None:
-                # Add performance metrics to segmented image as well
-                segmented_image = self.put_performance_metrics(segmented_image, process_time, cpu_percent, gpu_memory_mb, memory_used_mb, memory_total_mb)
-                cv2.imshow('Video', segmented_image)
-                # Save segmentation frame in video-specific folder
-                cv2.imwrite(os.path.join(self.output_dir, f'foot_seg_frame{self.frame_num}.jpg'), segmented_image)
-
             self.frame_num += 1
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            key = cv2.waitKey(0 if self.paused else 1) & 0xFF
+            if key == ord('q'):
                 logger.info("Process terminated by user")
                 break
+            elif key == ord(' '):  # Spacebar to toggle pause
+                self.paused = not self.paused
+            elif self.paused and key == ord('a'):
+                # Go back one frame
+                if self.input_type == 'video':
+                    pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, pos - 2))
+                    self.pause_frame = self.get_next_frame()
+                else:
+                    self.current_frame_idx = max(0, self.current_frame_idx - 2)
+                    self.pause_frame = self.get_next_frame()
+            elif self.paused and key == ord('d'):
+                # Go forward one frame
+                self.pause_frame = self.get_next_frame()
 
         self.release_resources()
         logger.info("Process completed successfully")
@@ -1281,7 +1318,8 @@ if __name__ == "__main__":
         yolo_model_path="./models/yolo11l.pt",
         shoe_model_path="./models/shoe_det_best_v1.pt",
         seg_model_path="./models/sam2.1_l.pt",
-        input_path="E:/amnt/quidich/data/17apr/camera08/16_45_17apr_balltest1.mp4",
+        # input_path="E:/amnt/quidich/data/Test_videos/SHGN1_S001_S002_T238_deinterlaced.mp4",
+        input_path="E:/amnt/quidich/data/17apr/camera08/22_39_17apr25_exp64.mp4",
         input_type='video',
         right_to_left=False,
         skip_seconds=10
