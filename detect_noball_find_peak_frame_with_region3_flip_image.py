@@ -146,22 +146,29 @@ class NoBallDetector:
 
         self.paused = False
         self.pause_frame = None
+        self.hoq = False
+
+        if self.right_to_left:
+            self.hoq = True
 
     def get_next_frame(self):
+
         if self.input_type == 'video':
             ret, frame = self.cap.read()
             if not ret:
                 return None
-            frame = cv2.resize(frame, (1920, 1080))
-            return frame
         else:  # frames directory
             if self.current_frame_idx >= len(self.frame_files):
                 return None
             frame_path = os.path.join(self.input_path, self.frame_files[self.current_frame_idx])
             frame = cv2.imread(frame_path)
             self.current_frame_idx += 1
-            frame = cv2.resize(frame, (1920, 1080))
-            return frame
+        frame = cv2.resize(frame, (1920, 1080))
+
+        if self.hoq:
+            self.right_to_left = False
+            frame = cv2.flip(frame, 1)
+        return frame
 
     def release_resources(self):
         if self.input_type == 'video':
@@ -736,7 +743,8 @@ class NoBallDetector:
         masks = shoe_seg[0].masks.data.cpu().numpy()
         heel_point = None
         toe_point = None
-        persistent_centroid_x, persistent_centroid_y = int(self.persistent_centroid[0]), int(self.persistent_centroid[1])
+        persistent_centroid_x, persistent_centroid_y = int(self.persistent_centroid[0]), int(
+            self.persistent_centroid[1])
         # Create an empty image for the mask
         mask_image = np.zeros_like(frame)
 
@@ -758,26 +766,18 @@ class NoBallDetector:
 
                     # Find toe point based on direction (either rightmost or leftmost point)
                     if not self.right_to_left:
-                        # toe_point = point1
-                        # heel_point = point2
                         # For left-to-right movement, toe is the minimum x coordinate
                         min_x_idx = np.argmin(x_coords)
                         toe_point = (x_coords[min_x_idx], y_coords[min_x_idx])
-                        max_x_idx = np.argmax(x_coords)
-                        heel_point = (x_coords[max_x_idx], y_coords[max_x_idx])
 
                         # Handle special case for heel
                         if heel_point[0] <= persistent_centroid_x:
                             max_x_idx = np.argmax(x_coords)
                             heel_point = (x_coords[max_x_idx], y_coords[max_x_idx])
                     else:
-                        # toe_point = point2
-                        # heel_point = point1
                         # For right-to-left movement, toe is the maximum x coordinate
                         max_x_idx = np.argmax(x_coords)
                         toe_point = (x_coords[max_x_idx], y_coords[max_x_idx])
-                        min_x_idx = np.argmin(x_coords)
-                        heel_point = (x_coords[min_x_idx], y_coords[min_x_idx])
 
                         # Handle special case for heel
                         if heel_point[0] >= persistent_centroid_x:
@@ -964,27 +964,15 @@ class NoBallDetector:
                     # Calculate heel point distance from the selected line
                     heel_distance = self.point_line_distance(heel_point, self.line_points)
 
-                    if not self.right_to_left:
-                        if heel_side == 'left' and toe_side == 'left' and heel_distance > 5:
-                            no_ball_text = "NO BALL - Both points crossed crease"
-                            no_ball_color = (0, 0, 255)  # Red color for no ball
-                            print("-------------------------------------------NO BALL DETECTED-------------------------------------------")
-                            cv2.imwrite(os.path.join(self.output_dir, f'no_ball_detected_{self.frame_num}.jpg'), segmented_image)
-                        else:
-                            no_ball_text = "Normal Delivery"
-                            no_ball_color = (0, 255, 0)  # Green color for normal delivery
+                    if heel_side == 'left' and toe_side == 'left' and heel_distance > 5:
+                        no_ball_text = "NO BALL - Both points crossed crease"
+                        no_ball_color = (0, 0, 255)  # Red color for no ball
+                        print("-------------------------------------------NO BALL DETECTED-------------------------------------------")
+                        cv2.imwrite(os.path.join(self.output_dir, f'no_ball_detected_{self.frame_num}.jpg'), segmented_image)
                     else:
-                        if heel_side == 'right' and toe_side == 'right' and heel_distance > 5:
-                            no_ball_text = "NO BALL - Both points crossed crease"
-                            no_ball_color = (0, 0, 255)  # Red color for no ball
-                            print(
-                                "-------------------------------------------NO BALL DETECTED-------------------------------------------")
-                            cv2.imwrite(os.path.join(self.output_dir, f'no_ball_detected_{self.frame_num}.jpg'),
-                                        segmented_image)
-                        else:
-                            no_ball_text = "Normal Delivery"
-                            no_ball_color = (0, 255, 0)  # Green color for normal delivery
-
+                        no_ball_text = "Normal Delivery"
+                        no_ball_color = (0, 255, 0)  # Green color for normal delivery
+                    
                     self.delivery_detected_count += 1
                     if self.delivery_detected_count >= 5:
                         self.skip_frames = int(self.skip_seconds * self.fps)
@@ -1154,7 +1142,6 @@ class NoBallDetector:
             self.current_frame_idx = 0
         self.frame_num = 0
         self.prev_time = time.time()
-
         # --- Main processing loop ---
         while True:
             frame_start_time = time.time()
@@ -1329,30 +1316,33 @@ class NoBallDetector:
         logger.info("Process completed successfully")
 
 
+
+
+
 if __name__ == "__main__":
     # Example usage for video
-    # detector = NoBallDetector(
-    #     yolo_model_path="./models/yolo11l.pt",
-    #     shoe_model_path="./models/shoe_det_best_v1.pt",
-    #     seg_model_path="./models/sam2.1_l.pt",
-    #     input_path="E:/amnt/quidich/data/Test_videos/SHGN1_S001_S002_T238_deinterlaced.mp4",
-    #     # input_path="E:/amnt/quidich/data/17apr/camera08/22_39_17apr25_exp64.mp4",
-    #     # input_path="E:/amnt/quidich/data/Test_videos/IND_BAN_TEST_1.MOV",
-    #     input_type='video',
-    #     right_to_left=False,
-    #     skip_seconds=10
-    # )
-    # detector.run()
-
-    # # Example usage for frames directory
     detector = NoBallDetector(
         yolo_model_path="./models/yolo11l.pt",
         shoe_model_path="./models/shoe_det_best_v1.pt",
         seg_model_path="./models/sam2.1_l.pt",
-        input_path="E:/amnt/quidich/data/17apr/camera04/23_47_17apr25_exp73_denoised",
-        input_type='frames',
+        # input_path="E:/amnt/quidich/data/Test_videos/SHGN1_S001_S002_T238_deinterlaced.mp4",
+        # input_path="E:/amnt/quidich/data/17apr/camera08/22_39_17apr25_exp64.mp4",
+        input_path="E:/amnt/quidich/data/Test_videos/IND_BAN_TEST_1.MOV",
+        input_type='video',
         right_to_left=True,
-        fps=100,
         skip_seconds=10
     )
     detector.run()
+
+    # # Example usage for frames directory
+    # detector = NoBallDetector(
+    #     yolo_model_path="./models/yolo11l.pt",
+    #     shoe_model_path="./models/shoe_det_best_v1.pt",
+    #     seg_model_path="./models/sam2.1_l.pt",
+    #     input_path="../data/17apr/camera08/23_47_17apr25_exp73",
+    #     input_type='frames',
+    #     right_to_left=False,
+    #     fps=100,
+    #     skip_seconds=10
+    # )
+    # detector.run()
